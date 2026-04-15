@@ -1,0 +1,6 @@
+{
+  "name": "Order APP",
+  "description": "Professional restaurant ordering system with QR code menus and real-time order management.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
