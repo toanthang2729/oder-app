@@ -10,7 +10,11 @@ service cloud.firestore {
 
     function isAdmin() {
       return isAuthenticated() && 
-             (request.auth.token.email == "toanthang2729@gmail.com" && request.auth.token.email_verified == true);
+             (request.auth.token.email == "toanthang2729@gmail.com");
+    }
+
+    function isSuperAdmin() {
+      return isAdmin();
     }
 
     function getUserData() {
@@ -19,14 +23,15 @@ service cloud.firestore {
 
     function isOwner(restaurantId) {
       return isAuthenticated() && 
-             (get(/databases/$(database)/documents/restaurants/$(restaurantId)).data.ownerUid == request.auth.uid ||
-              getUserData().role == 'owner' && getUserData().restaurantId == restaurantId);
+             (isSuperAdmin() ||
+              get(/databases/$(database)/documents/restaurants/$(restaurantId)).data.ownerUid == request.auth.uid ||
+              (getUserData().role == 'owner' && getUserData().restaurantId == restaurantId));
     }
 
     function hasRole(restaurantId, roles) {
       return isAuthenticated() && 
-             getUserData().restaurantId == restaurantId && 
-             getUserData().role in roles;
+             (isSuperAdmin() ||
+              (getUserData().restaurantId == restaurantId && getUserData().role in roles));
     }
 
     function isValidUser(data) {
@@ -50,7 +55,7 @@ service cloud.firestore {
       return data.restaurantId is string &&
              data.items is list && data.items.size() > 0 &&
              data.total is number && data.total >= 0 &&
-             data.status in ['pending', 'cooking', 'ready', 'served', 'paid', 'completed', 'cancelled'];
+             data.status in ['pending', 'cooking', 'ready', 'served', 'paid', 'completed', 'cancelled', 'archived'];
     }
 
     // ===============================================================
@@ -58,15 +63,17 @@ service cloud.firestore {
     // ===============================================================
 
     match /users/{userId} {
-      allow read: if isAuthenticated() && (request.auth.uid == userId || getUserData().role == 'owner');
-      allow create: if isAuthenticated() && request.auth.uid == userId && isValidUser(request.resource.data);
-      allow update: if isAuthenticated() && (request.auth.uid == userId || (getUserData().role == 'owner' && getUserData().restaurantId == resource.data.restaurantId)) && isValidUser(request.resource.data);
+      allow read: if isAuthenticated() && (isSuperAdmin() || request.auth.uid == userId || getUserData().role == 'owner');
+      allow create: if isAuthenticated() && (isSuperAdmin() || request.auth.uid == userId || (getUserData().role == 'owner' && isOwner(request.resource.data.restaurantId))) && isValidUser(request.resource.data);
+      allow update: if isAuthenticated() && (isSuperAdmin() || request.auth.uid == userId || (getUserData().role == 'owner' && getUserData().restaurantId == resource.data.restaurantId)) && isValidUser(request.resource.data);
+      allow delete: if isSuperAdmin();
     }
 
     match /restaurants/{restaurantId} {
       allow read: if true;
-      allow create: if isAuthenticated() && isValidRestaurant(request.resource.data);
+      allow create: if isAuthenticated() && (isSuperAdmin() || isValidRestaurant(request.resource.data));
       allow update: if isOwner(restaurantId) && isValidRestaurant(request.resource.data);
+      allow delete: if isSuperAdmin();
       
       match /menuItems/{itemId} {
         allow read: if true;

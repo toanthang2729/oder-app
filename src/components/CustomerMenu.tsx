@@ -1,8 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { db } from '../lib/firebase';
-import { collection, query, onSnapshot, addDoc, serverTimestamp, doc, getDoc } from 'firebase/firestore';
-import { Restaurant, MenuItem, OrderItem } from '../types';
-import { ShoppingBag, Utensils, Plus, Minus, ChevronRight, CheckCircle2, Loader2 } from 'lucide-react';
+import { collection, query, onSnapshot, addDoc, serverTimestamp, doc, getDoc, where } from 'firebase/firestore';
+import { Restaurant, MenuItem, OrderItem, Order } from '../types';
+import { ShoppingBag, Utensils, Plus, Minus, ChevronRight, CheckCircle2, Loader2, BellRing, Receipt } from 'lucide-react';
 import { formatCurrency, cn } from '../lib/utils';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -14,6 +14,9 @@ export default function CustomerMenu({ restaurantId, tableNumber }: { restaurant
   const [isOrdering, setIsOrdering] = useState(false);
   const [orderSuccess, setOrderSuccess] = useState(false);
   const [selectedCategory, setSelectedCategory] = useState('Tất cả');
+  const [isCallingWaiter, setIsCallingWaiter] = useState(false);
+  const [callSuccess, setCallSuccess] = useState(false);
+  const [tableOrders, setTableOrders] = useState<Order[]>([]);
 
   useEffect(() => {
     // Fetch restaurant info
@@ -27,14 +30,27 @@ export default function CustomerMenu({ restaurantId, tableNumber }: { restaurant
 
     // Fetch menu items
     const q = query(collection(db, 'restaurants', restaurantId, 'menuItems'));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
+    const unsubscribeMenu = onSnapshot(q, (snapshot) => {
       setMenuItems(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as MenuItem)));
       setLoading(false);
     });
 
+    // Fetch active orders for this table
+    const ordersQ = query(
+      collection(db, 'restaurants', restaurantId, 'orders'),
+      where('tableNumber', '==', tableNumber)
+    );
+    const unsubscribeOrders = onSnapshot(ordersQ, (snapshot) => {
+      const fetchedOrders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Order));
+      setTableOrders(fetchedOrders);
+    });
+
     fetchRestaurant();
-    return unsubscribe;
-  }, [restaurantId]);
+    return () => {
+      unsubscribeMenu();
+      unsubscribeOrders();
+    };
+  }, [restaurantId, tableNumber]);
 
   const addToCart = (itemId: string) => {
     setCart(prev => ({ ...prev, [itemId]: (prev[itemId] || 0) + 1 }));
@@ -91,10 +107,56 @@ export default function CustomerMenu({ restaurantId, tableNumber }: { restaurant
     }
   };
 
+  const callWaiter = async () => {
+    setIsCallingWaiter(true);
+    try {
+      // Create a special order to notify staff
+      await addDoc(collection(db, 'restaurants', restaurantId, 'orders'), {
+        restaurantId,
+        tableNumber,
+        items: [{
+          id: 'call_waiter',
+          name: '🛎️ GỌI PHỤC VỤ',
+          price: 0,
+          quantity: 1
+        }],
+        total: 0,
+        status: 'pending',
+        createdAt: serverTimestamp()
+      });
+      setCallSuccess(true);
+      setTimeout(() => setCallSuccess(false), 5000); // Reset after 5 seconds
+    } catch (error) {
+      console.error("Error calling waiter:", error);
+    } finally {
+      setIsCallingWaiter(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-zinc-50">
         <Loader2 className="w-8 h-8 animate-spin text-orange-500" />
+      </div>
+    );
+  }
+
+  if (restaurant && !restaurant.isSessionActive) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center bg-zinc-50 p-6 text-center">
+        <motion.div
+          initial={{ scale: 0.5, opacity: 0 }}
+          animate={{ scale: 1, opacity: 1 }}
+          className="bg-white p-12 rounded-3xl shadow-xl shadow-zinc-200/50 border border-zinc-100 max-w-sm w-full"
+        >
+          <div className="w-20 h-20 bg-zinc-100 rounded-full flex items-center justify-center mx-auto mb-6">
+            <Utensils className="w-10 h-10 text-zinc-400" />
+          </div>
+          <h2 className="text-2xl font-serif text-zinc-800 mb-3">Chưa tới giờ mở cửa</h2>
+          <p className="text-zinc-500 mb-8 leading-relaxed">
+            Nhà hàng hiện chưa bắt đầu ca làm việc. Vui lòng quay lại sau nhé!
+          </p>
+        </motion.div>
       </div>
     );
   }
@@ -138,9 +200,25 @@ export default function CustomerMenu({ restaurantId, tableNumber }: { restaurant
             <h1 className="text-xl font-serif">{restaurant?.name || 'Order APP'}</h1>
             <p className="text-[10px] font-bold opacity-70 uppercase tracking-widest mt-1">Bàn {tableNumber}</p>
           </div>
-          <div className="w-10 h-10 bg-white/10 rounded-full flex items-center justify-center backdrop-blur-sm">
-            <Utensils className="text-white w-5 h-5" />
-          </div>
+          <button 
+            onClick={callWaiter}
+            disabled={isCallingWaiter || callSuccess}
+            className={cn(
+              "flex items-center gap-2 px-4 py-2 rounded-full text-xs font-bold transition-all shadow-sm",
+              callSuccess 
+                ? "bg-emerald-500 text-white" 
+                : "bg-white text-olive hover:bg-bg"
+            )}
+          >
+            {isCallingWaiter ? (
+              <Loader2 size={16} className="animate-spin" />
+            ) : callSuccess ? (
+              <CheckCircle2 size={16} />
+            ) : (
+              <BellRing size={16} />
+            )}
+            {callSuccess ? 'Đã gọi' : 'Gọi phục vụ'}
+          </button>
         </div>
       </header>
 

@@ -1,10 +1,11 @@
 import React, { useState, useEffect } from 'react';
-import { User } from 'firebase/auth';
+import { User, getAuth, createUserWithEmailAndPassword } from 'firebase/auth';
+import { initializeApp } from 'firebase/app';
 import { db, auth, storage } from '../lib/firebase';
-import { collection, query, where, onSnapshot, addDoc, updateDoc, doc, serverTimestamp, orderBy, getDoc, setDoc } from 'firebase/firestore';
+import { collection, query, where, onSnapshot, addDoc, updateDoc, doc, serverTimestamp, orderBy, getDoc, setDoc, deleteDoc } from 'firebase/firestore';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { Restaurant, MenuItem, Order, UserRole, UserProfile } from '../types';
-import { LayoutDashboard, Utensils, ClipboardList, QrCode, LogOut, Plus, Check, X, Clock, ChevronRight, Image as ImageIcon, Upload, Loader2, Camera, BarChart3, ShieldCheck, Star, Users, Wallet, ChefHat, Bell } from 'lucide-react';
+import { LayoutDashboard, Utensils, ClipboardList, QrCode, LogOut, Plus, Check, X, Clock, ChevronRight, Image as ImageIcon, Upload, Loader2, Camera, BarChart3, ShieldCheck, Star, Users, Wallet, ChefHat, Bell, BellRing, Pencil, Trash2 } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
 import { formatCurrency, cn } from '../lib/utils';
 import { motion, AnimatePresence } from 'motion/react';
@@ -17,11 +18,13 @@ export default function AdminDashboard({ user }: { user: User }) {
   const [isAddingItem, setIsAddingItem] = useState(false);
   const [isUpgradingPlan, setIsUpgradingPlan] = useState(false);
   const [userRole, setUserRole] = useState<UserRole>('owner');
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [isAddingStaff, setIsAddingStaff] = useState(false);
   const [staffList, setStaffList] = useState<UserProfile[]>([]);
   const [newStaff, setNewStaff] = useState({ phone: '', password: '', role: 'waiter' as UserRole });
   const [isUploading, setIsUploading] = useState<number | null>(null);
   const [newItem, setNewItem] = useState({ name: '', price: '', category: 'Món chính', description: '', imageUrls: ['', ''] });
+  const [editingItem, setEditingItem] = useState<MenuItem | null>(null);
 
   const categories = [
     'Món khai vị',
@@ -42,6 +45,7 @@ export default function AdminDashboard({ user }: { user: User }) {
       const userDoc = await getDoc(doc(db, 'users', user.uid));
       if (userDoc.exists()) {
         const userData = userDoc.data() as UserProfile;
+        setUserProfile(userData);
         setUserRole(userData.role);
 
         if (userData.role === 'owner') {
@@ -136,17 +140,50 @@ export default function AdminDashboard({ user }: { user: User }) {
 
     try {
       setIsUploading(index);
-      const storageRef = ref(storage, `restaurants/${restaurant.id}/menu/${Date.now()}_${file.name}`);
-      const snapshot = await uploadBytes(storageRef, file);
-      const downloadURL = await getDownloadURL(snapshot.ref);
       
-      const urls = [...newItem.imageUrls];
-      urls[index] = downloadURL;
-      setNewItem({ ...newItem, imageUrls: urls });
+      // Compress image and convert to base64 to avoid Storage permission issues
+      const reader = new FileReader();
+      reader.readAsDataURL(file);
+      reader.onload = (event) => {
+        const img = new Image();
+        img.src = event.target?.result as string;
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          const MAX_WIDTH = 800;
+          const MAX_HEIGHT = 800;
+          let width = img.width;
+          let height = img.height;
+
+          if (width > height) {
+            if (width > MAX_WIDTH) {
+              height *= MAX_WIDTH / width;
+              width = MAX_WIDTH;
+            }
+          } else {
+            if (height > MAX_HEIGHT) {
+              width *= MAX_HEIGHT / height;
+              height = MAX_HEIGHT;
+            }
+          }
+
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            ctx.drawImage(img, 0, 0, width, height);
+            // Compress to JPEG with 0.7 quality
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
+            
+            const urls = [...newItem.imageUrls];
+            urls[index] = dataUrl;
+            setNewItem({ ...newItem, imageUrls: urls });
+          }
+          setIsUploading(null);
+        };
+      };
     } catch (error) {
       console.error("Error uploading image:", error);
       alert("Lỗi khi tải ảnh lên. Vui lòng thử lại.");
-    } finally {
       setIsUploading(null);
     }
   };
@@ -166,29 +203,53 @@ export default function AdminDashboard({ user }: { user: User }) {
     setIsAddingItem(false);
   };
 
+  const handleUpdateItem = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!restaurant || !editingItem) return;
+
+    await updateDoc(doc(db, 'restaurants', restaurant.id, 'menuItems', editingItem.id), {
+      name: editingItem.name,
+      price: Number(editingItem.price),
+      category: editingItem.category,
+      description: editingItem.description,
+      available: editingItem.available
+    });
+    setEditingItem(null);
+  };
+
+  const handleDeleteItem = async (itemId: string) => {
+    if (!restaurant) return;
+    if (window.confirm('Bạn có chắc chắn muốn xóa món này khỏi thực đơn?')) {
+      await deleteDoc(doc(db, 'restaurants', restaurant.id, 'menuItems', itemId));
+    }
+  };
+
   const handleAddStaff = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!restaurant) return;
+    if (!restaurant) {
+      alert('Không tìm thấy thông tin nhà hàng.');
+      return;
+    }
+    if (!userProfile) {
+      alert('Không tìm thấy thông tin chủ quán.');
+      return;
+    }
 
     try {
-      // In a real app, we'd use a cloud function to create the user in Auth
-      // For this prototype, we'll simulate it by creating a document in 'users'
-      // and the staff member will "register" with the same phone/pass to link up
-      // OR we can just create the doc and assume the owner gives them credentials.
+      // Create a secondary Firebase app instance to create the staff user without logging out the owner
+      const secondaryApp = initializeApp(auth.app.options, `SecondaryApp_${Date.now()}`);
+      const secondaryAuth = getAuth(secondaryApp);
       
-      // For simplicity in this environment, we'll use the "Phone as Email" trick
-      const email = `${newStaff.phone}@restaurant.com`;
+      const email = `staff_${userProfile.phone}_${newStaff.phone}@restaurant.com`;
       
-      // We can't easily create another user from the current session without logging out
-      // So we'll just create the profile doc, and the staff member can "Sign Up" 
-      // with their phone to claim it, or we can use a dedicated "Staff Login" logic.
-      
-      // Better approach for prototype: Just add to a 'staff' subcollection or 'users' with a flag
-      const staffRef = doc(collection(db, 'users'));
+      const result = await createUserWithEmailAndPassword(secondaryAuth, email, newStaff.password);
+      await secondaryAuth.signOut(); // Sign out the secondary app
+
+      const staffRef = doc(db, 'users', result.user.uid);
       await setDoc(staffRef, {
-        uid: staffRef.id,
+        uid: result.user.uid,
         phone: newStaff.phone,
-        password: newStaff.password, // Storing plain text for prototype demo ONLY
+        ownerPhone: userProfile.phone,
         role: newStaff.role,
         restaurantId: restaurant.id,
         createdAt: serverTimestamp()
@@ -197,8 +258,13 @@ export default function AdminDashboard({ user }: { user: User }) {
       alert(`Đã thêm ${newStaff.role === 'cashier' ? 'Thu ngân' : 'Phục vụ'} thành công!`);
       setIsAddingStaff(false);
       setNewStaff({ phone: '', password: '', role: 'waiter' });
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error adding staff:", error);
+      if (error.code === 'auth/email-already-in-use') {
+        alert('Số điện thoại nhân viên này đã được đăng ký cho nhà hàng của bạn.');
+      } else {
+        alert('Có lỗi xảy ra: ' + error.message);
+      }
     }
   };
 
@@ -209,16 +275,64 @@ export default function AdminDashboard({ user }: { user: User }) {
 
   const clearTable = async (tableNumber: string) => {
     if (!restaurant) return;
-    // Find all paid orders for this table and archive them or just mark table as free
-    // In this simple app, we'll just mark the latest order as 'completed' or similar
-    const tableOrders = orders.filter(o => o.tableNumber === tableNumber && o.status === 'paid');
-    for (const order of tableOrders) {
-      await updateDoc(doc(db, 'restaurants', restaurant.id, 'orders', order.id), { status: 'completed' });
+    try {
+      // Find all paid, completed, and cancelled orders for this table and archive them
+      const tableOrders = orders.filter(o => 
+        o.tableNumber === tableNumber && 
+        (o.status === 'paid' || o.status === 'completed' || o.status === 'cancelled')
+      );
+      for (const order of tableOrders) {
+        await updateDoc(doc(db, 'restaurants', restaurant.id, 'orders', order.id), { status: 'archived' });
+      }
+      alert(`Bàn ${tableNumber} đã được dọn sạch và sẵn sàng đón khách mới.`);
+    } catch (error) {
+      console.error("Error clearing table:", error);
+      alert("Có lỗi xảy ra khi dọn bàn.");
     }
-    alert(`Bàn ${tableNumber} đã được dọn sạch và sẵn sàng đón khách mới.`);
+  };
+
+  const updateTableOrders = async (tableNumber: string, fromStatuses: string[], toStatus: string) => {
+    if (!restaurant) return;
+    const tableOrders = orders.filter(o => o.tableNumber === tableNumber && fromStatuses.includes(o.status));
+    for (const order of tableOrders) {
+      await updateDoc(doc(db, 'restaurants', restaurant.id, 'orders', order.id), { status: toStatus });
+    }
+  };
+
+  const downloadQR = () => {
+    const svg = document.getElementById("qr-code-svg");
+    if (!svg) return;
+    const svgData = new XMLSerializer().serializeToString(svg);
+    const blob = new Blob([svgData], { type: "image/svg+xml;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const downloadLink = document.createElement("a");
+    downloadLink.href = url;
+    downloadLink.download = `QR_Ban_${selectedTable}.svg`;
+    document.body.appendChild(downloadLink);
+    downloadLink.click();
+    document.body.removeChild(downloadLink);
   };
 
   const qrUrl = `${window.location.origin}/?restaurantId=${restaurant?.id}`;
+
+  const startSession = async () => {
+    if (!restaurant) return;
+    if (window.confirm('Bạn có chắc chắn muốn bắt đầu ca làm việc mới? Doanh thu sẽ được tính từ thời điểm này.')) {
+      await updateDoc(doc(db, 'restaurants', restaurant.id), {
+        isSessionActive: true,
+        sessionStartTime: serverTimestamp()
+      });
+    }
+  };
+
+  const endSession = async () => {
+    if (!restaurant) return;
+    if (window.confirm('Bạn có chắc chắn muốn kết thúc ca làm việc? Khách hàng sẽ không thể đặt món cho đến khi bạn bắt đầu ca mới.')) {
+      await updateDoc(doc(db, 'restaurants', restaurant.id), {
+        isSessionActive: false
+      });
+    }
+  };
 
   return (
     <div className="min-h-screen bg-bg flex">
@@ -241,7 +355,7 @@ export default function AdminDashboard({ user }: { user: User }) {
               )}
             >
               <ClipboardList size={20} />
-              {userRole === 'waiter' ? 'Đơn hàng bếp' : 'Quản lý đơn'}
+              {userRole === 'waiter' ? 'Đơn hàng' : 'Quản lý đơn'}
               {orders.filter(o => o.status === 'pending').length > 0 && (
                 <span className="ml-auto bg-soft-clay text-sidebar text-[10px] px-2 py-0.5 rounded-full font-bold">
                   {orders.filter(o => o.status === 'pending').length}
@@ -279,25 +393,6 @@ export default function AdminDashboard({ user }: { user: User }) {
           {userRole === 'owner' && (
             <>
               <button
-                onClick={() => {
-                  if (restaurant?.plan === 'pro') {
-                    setActiveTab('analytics');
-                  } else {
-                    setIsUpgradingPlan(true);
-                  }
-                }}
-                className={cn(
-                  "w-full flex items-center gap-3 px-4 py-3 rounded-xl font-medium transition-all text-sm relative",
-                  activeTab === 'analytics' ? "bg-accent text-white" : "text-white/60 hover:bg-white/5"
-                )}
-              >
-                <BarChart3 size={20} />
-                Doanh thu
-                {restaurant?.plan !== 'pro' && (
-                  <Star size={12} className="ml-auto text-soft-clay fill-soft-clay" />
-                )}
-              </button>
-              <button
                 onClick={() => setActiveTab('staff')}
                 className={cn(
                   "w-full flex items-center gap-3 px-4 py-3 rounded-xl font-medium transition-all text-sm",
@@ -306,6 +401,17 @@ export default function AdminDashboard({ user }: { user: User }) {
               >
                 <Users size={20} />
                 Nhân viên
+              </button>
+              
+              <button
+                onClick={() => setActiveTab('management')}
+                className={cn(
+                  "w-full flex items-center gap-3 px-4 py-3 rounded-xl font-medium transition-all text-sm",
+                  activeTab === 'management' ? "bg-accent text-white" : "text-white/60 hover:bg-white/5"
+                )}
+              >
+                <BarChart3 size={20} />
+                Quản lý & Báo cáo
               </button>
             </>
           )}
@@ -371,34 +477,59 @@ export default function AdminDashboard({ user }: { user: User }) {
               {activeTab === 'qr' && 'Mã QR của bạn'}
             </h2>
             <p className="text-text-muted text-sm">
-              {activeTab === 'orders' && `Hôm nay bạn có ${orders.length} đơn hàng mới.`}
+              {activeTab === 'orders' && `Hôm nay bạn có ${orders.filter(o => o.status !== 'archived').length} đơn hàng mới.`}
               {activeTab !== 'orders' && restaurant?.name}
             </p>
           </div>
-          {activeTab === 'menu' && (
-            <button
-              onClick={() => setIsAddingItem(true)}
-              className="bg-olive text-white px-6 py-3 rounded-xl font-bold flex items-center gap-2 hover:bg-olive/90 transition-all shadow-lg shadow-olive/10"
-            >
-              <Plus size={20} />
-              Thêm món mới
-            </button>
-          )}
+          <div className="flex gap-3">
+            {activeTab === 'orders' && (userRole === 'owner' || userRole === 'cashier') && (
+              restaurant?.isSessionActive ? (
+                <button
+                  onClick={endSession}
+                  className="bg-red-500 text-white px-6 py-3 rounded-xl font-bold flex items-center gap-2 hover:bg-red-600 transition-all shadow-lg shadow-red-500/20"
+                >
+                  Kết thúc ca
+                </button>
+              ) : (
+                <button
+                  onClick={startSession}
+                  className="bg-emerald-500 text-white px-6 py-3 rounded-xl font-bold flex items-center gap-2 hover:bg-emerald-600 transition-all shadow-lg shadow-emerald-500/20"
+                >
+                  Bắt đầu ca
+                </button>
+              )
+            )}
+            {activeTab === 'menu' && userRole === 'owner' && (
+              <button
+                onClick={() => setIsAddingItem(true)}
+                className="bg-olive text-white px-6 py-3 rounded-xl font-bold flex items-center gap-2 hover:bg-olive/90 transition-all shadow-lg shadow-olive/10"
+              >
+                <Plus size={20} />
+                Thêm món mới
+              </button>
+            )}
+          </div>
         </header>
 
         {activeTab === 'orders' && (
           <div className="grid grid-cols-3 gap-4 mb-10">
             <div className="bg-white p-6 rounded-2xl border border-border shadow-sm">
-              <div className="text-[11px] uppercase tracking-wider text-text-muted font-bold mb-1">Doanh thu (Ngày)</div>
-              <div className="text-2xl font-medium text-text-main">{formatCurrency(orders.filter(o => o.status === 'paid' || o.status === 'completed').reduce((acc, o) => acc + o.total, 0))}</div>
+              <div className="text-[11px] uppercase tracking-wider text-text-muted font-bold mb-1">Doanh thu (Ca hiện tại)</div>
+              <div className="text-2xl font-medium text-text-main">
+                {formatCurrency(orders.filter(o => {
+                  if (o.status !== 'paid' && o.status !== 'completed' && o.status !== 'archived') return false;
+                  if (!o.createdAt || !restaurant?.sessionStartTime) return false;
+                  return o.createdAt.toMillis() >= restaurant.sessionStartTime.toMillis();
+                }).reduce((acc, o) => acc + o.total, 0))}
+              </div>
             </div>
             <div className="bg-white p-6 rounded-2xl border border-border shadow-sm">
               <div className="text-[11px] uppercase tracking-wider text-text-muted font-bold mb-1">Đơn đang phục vụ</div>
-              <div className="text-2xl font-medium text-text-main">{orders.filter(o => o.status !== 'paid' && o.status !== 'completed' && o.status !== 'cancelled').length}</div>
+              <div className="text-2xl font-medium text-text-main">{orders.filter(o => o.status !== 'paid' && o.status !== 'completed' && o.status !== 'cancelled' && o.status !== 'archived').length}</div>
             </div>
             <div className="bg-white p-6 rounded-2xl border border-border shadow-sm">
               <div className="text-[11px] uppercase tracking-wider text-text-muted font-bold mb-1">Bàn trống</div>
-              <div className="text-2xl font-medium text-text-main">{numTables - new Set(orders.filter(o => o.status !== 'paid' && o.status !== 'completed').map(o => o.tableNumber)).size}</div>
+              <div className="text-2xl font-medium text-text-main">{numTables - new Set(orders.filter(o => o.status !== 'paid' && o.status !== 'completed' && o.status !== 'archived' && o.status !== 'cancelled').map(o => o.tableNumber)).size}</div>
             </div>
           </div>
         )}
@@ -410,103 +541,117 @@ export default function AdminDashboard({ user }: { user: User }) {
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -10 }}
-              className="space-y-4"
+              className="space-y-6"
             >
-              <div className="text-sm font-bold uppercase text-text-muted tracking-wide mb-4">Đơn hàng chờ xử lý</div>
-              {orders.length === 0 ? (
-                <div className="py-20 text-center bg-white rounded-2xl border border-border">
-                  <ClipboardList className="w-12 h-12 text-border mx-auto mb-4" />
-                  <p className="text-text-muted">Chưa có đơn hàng nào</p>
-                </div>
-              ) : (
-                orders.map((order) => (
-                  <div key={order.id} className="bg-white rounded-xl border border-border p-5 shadow-sm border-l-4 border-l-olive flex justify-between items-center group">
-                    <div className="flex-1">
-                      <div className="flex items-center gap-4 mb-2">
-                        <span className="text-xs font-bold text-text-main">Bàn số {order.tableNumber}</span>
-                        <span className="text-[10px] text-text-muted">•</span>
-                        <span className="text-xs text-text-muted">{new Date(order.createdAt?.seconds * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-                      </div>
-                      <div className="text-sm font-medium text-text-main">
-                        {order.items.map(i => `${i.quantity} ${i.name}`).join(', ')}
-                      </div>
-                    </div>
-
-                    <div className="flex items-center gap-4">
-                      <div className="text-right mr-4">
-                        <div className="text-sm font-bold text-text-main">{formatCurrency(order.total)}</div>
-                        <div className={cn(
-                          "text-[10px] font-bold uppercase mt-1",
-                          order.status === 'pending' ? "text-amber-600" :
-                          order.status === 'cooking' ? "text-blue-600" :
-                          order.status === 'ready' ? "text-purple-600" :
-                          order.status === 'served' ? "text-indigo-600" :
-                          order.status === 'paid' ? "text-emerald-600" :
-                          "text-text-muted"
-                        )}>
-                          {order.status === 'pending' ? 'Chờ xác nhận' :
-                           order.status === 'cooking' ? 'Đang chế biến' :
-                           order.status === 'ready' ? 'Bếp xong' :
-                           order.status === 'served' ? 'Đã phục vụ' :
-                           order.status === 'paid' ? 'Đã thanh toán' :
-                           order.status === 'completed' ? 'Hoàn tất' : 'Đã hủy'}
-                        </div>
-                      </div>
- 
-                      <div className="flex flex-col gap-2 min-w-[140px]">
-                        {order.status === 'pending' && (userRole === 'owner' || userRole === 'cashier') && (
-                          <div className="grid grid-cols-2 gap-2">
-                            <button
-                              onClick={() => updateOrderStatus(order.id, 'cancelled')}
-                              className="flex items-center justify-center gap-1 py-1.5 rounded-lg border border-border text-text-muted font-bold hover:bg-red-50 hover:text-red-500 transition-all text-[10px]"
-                            >
-                              <X size={12} /> Hủy
-                            </button>
-                            <button
-                              onClick={() => updateOrderStatus(order.id, 'cooking')}
-                              className="flex items-center justify-center gap-1 py-1.5 rounded-lg bg-olive text-white font-bold hover:bg-olive/90 transition-all text-[10px]"
-                            >
-                              <Check size={12} /> Xác nhận
-                            </button>
-                          </div>
-                        )}
-                        {order.status === 'cooking' && (userRole === 'owner' || userRole === 'waiter') && (
-                          <button
-                            onClick={() => updateOrderStatus(order.id, 'ready')}
-                            className="w-full flex items-center justify-center gap-2 py-2 rounded-lg bg-purple-600 text-white font-bold hover:bg-purple-700 transition-all text-xs"
-                          >
-                            <ChefHat size={14} /> Bếp xong
-                          </button>
-                        )}
-                        {order.status === 'ready' && (userRole === 'owner' || userRole === 'waiter') && (
-                          <button
-                            onClick={() => updateOrderStatus(order.id, 'served')}
-                            className="w-full flex items-center justify-center gap-2 py-2 rounded-lg bg-indigo-600 text-white font-bold hover:bg-indigo-700 transition-all text-xs"
-                          >
-                            <Bell size={14} /> Phục vụ xong
-                          </button>
-                        )}
-                        {order.status === 'served' && (userRole === 'owner' || userRole === 'cashier') && (
-                          <button
-                            onClick={() => updateOrderStatus(order.id, 'paid')}
-                            className="w-full flex items-center justify-center gap-2 py-2 rounded-lg bg-emerald-600 text-white font-bold hover:bg-emerald-700 transition-all text-xs"
-                          >
-                            <Wallet size={14} /> Thu tiền
-                          </button>
-                        )}
-                        {order.status === 'paid' && (userRole === 'owner' || userRole === 'cashier') && (
-                          <button
-                            onClick={() => clearTable(order.tableNumber)}
-                            className="w-full flex items-center justify-center gap-2 py-2 rounded-lg border-2 border-emerald-600 text-emerald-600 font-bold hover:bg-emerald-50 transition-all text-xs"
-                          >
-                            <Check size={14} /> Trả bàn (Trống)
-                          </button>
-                        )}
-                      </div>
-                    </div>
+              {/* Service Requests Section */}
+              {orders.filter(o => o.status === 'pending' && o.items.length === 1 && o.items[0].id === 'call_waiter').length > 0 && (
+                <div className="space-y-3">
+                  <div className="text-sm font-bold uppercase text-amber-600 tracking-wide flex items-center gap-2">
+                    <BellRing size={16} /> Yêu cầu hỗ trợ
                   </div>
-                ))
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                    {orders
+                      .filter(o => o.status === 'pending' && o.items.length === 1 && o.items[0].id === 'call_waiter')
+                      .map(request => (
+                        <div key={request.id} className="bg-amber-50 border border-amber-200 rounded-xl p-4 flex justify-between items-center shadow-sm">
+                          <div>
+                            <div className="font-bold text-amber-900">Bàn số {request.tableNumber}</div>
+                            <div className="text-xs text-amber-700 mt-1">Đang gọi phục vụ</div>
+                          </div>
+                          <button 
+                            onClick={() => updateOrderStatus(request.id, 'completed')}
+                            className="bg-amber-500 text-white px-4 py-2 rounded-lg text-xs font-bold hover:bg-amber-600 transition-colors shadow-sm"
+                          >
+                            Đã hỗ trợ
+                          </button>
+                        </div>
+                      ))}
+                  </div>
+                </div>
               )}
+
+              {/* Food Orders Section */}
+              <div className="space-y-4">
+                <div className="text-sm font-bold uppercase text-text-muted tracking-wide mb-4">Đơn hàng chờ xử lý</div>
+                {orders.filter(o => o.status !== 'completed' && o.status !== 'cancelled' && o.status !== 'archived' && !(o.items.length === 1 && o.items[0].id === 'call_waiter')).length === 0 ? (
+                  <div className="py-20 text-center bg-white rounded-2xl border border-border">
+                    <ClipboardList className="w-12 h-12 text-border mx-auto mb-4" />
+                    <p className="text-text-muted">Chưa có đơn hàng nào</p>
+                  </div>
+                ) : (
+                  Array.from(new Set<string>(orders.filter(o => o.status !== 'completed' && o.status !== 'cancelled' && o.status !== 'archived' && !(o.items.length === 1 && o.items[0].id === 'call_waiter')).map(o => o.tableNumber)))
+                    .sort((a, b) => Number(a) - Number(b))
+                    .map((tableNumber: string) => {
+                      const tableOrders = orders.filter(o => o.tableNumber === tableNumber && o.status !== 'completed' && o.status !== 'cancelled' && o.status !== 'archived' && !(o.items.length === 1 && o.items[0].id === 'call_waiter'));
+                      const tableTotal = tableOrders.reduce((acc, o) => acc + o.total, 0);
+                      
+                      // Aggregate items
+                      const aggregatedItems = tableOrders.flatMap(o => o.items).reduce((acc, item) => {
+                        const existing = acc.find(i => i.name === item.name);
+                        if (existing) {
+                          existing.quantity += item.quantity;
+                        } else {
+                          acc.push({ ...item });
+                        }
+                        return acc;
+                      }, [] as typeof tableOrders[0]['items'][0][]);
+
+                      const hasPending = tableOrders.some(o => o.status === 'pending');
+                      const hasCookingOrReady = tableOrders.some(o => o.status === 'cooking' || o.status === 'ready');
+                      const hasServed = tableOrders.some(o => o.status === 'served');
+                      const allPaid = tableOrders.every(o => o.status === 'paid');
+
+                      return (
+                        <div key={tableNumber} className="bg-white rounded-xl border border-border p-5 shadow-sm border-l-4 border-l-olive">
+                          <div className="flex justify-between items-center mb-4 border-b border-border pb-3">
+                            <h3 className="text-lg font-bold text-text-main">Bàn số {tableNumber}</h3>
+                            <div className="text-sm font-bold text-olive">{formatCurrency(tableTotal)}</div>
+                          </div>
+                          
+                          <div className="mb-4 space-y-2">
+                            {aggregatedItems.map((item, idx) => (
+                              <div key={idx} className="flex justify-between items-center text-sm">
+                                <span className="font-medium text-text-main">{item.quantity}x {item.name}</span>
+                                <span className="text-text-muted">{formatCurrency(item.price * item.quantity)}</span>
+                              </div>
+                            ))}
+                          </div>
+
+                        <div className="flex gap-2 mt-4">
+                          {(userRole === 'owner' || userRole === 'cashier') && (
+                            <button 
+                              onClick={() => updateTableOrders(tableNumber, ['pending', 'cooking', 'ready'], 'served')}
+                              className={cn("flex-1 py-2.5 rounded-lg font-bold text-xs transition-all flex items-center justify-center gap-1", (hasPending || hasCookingOrReady) ? "bg-indigo-500 text-white hover:bg-indigo-600 shadow-md shadow-indigo-500/20" : "bg-gray-100 text-gray-400 cursor-not-allowed")}
+                              disabled={!(hasPending || hasCookingOrReady)}
+                            >
+                              <Bell size={14} /> Đã Phục vụ
+                            </button>
+                          )}
+
+                          {(userRole === 'owner' || userRole === 'cashier') && (
+                            <button 
+                              onClick={() => updateTableOrders(tableNumber, ['served'], 'paid')}
+                              className={cn("flex-1 py-2.5 rounded-lg font-bold text-xs transition-all flex items-center justify-center gap-1", hasServed ? "bg-emerald-500 text-white hover:bg-emerald-600 shadow-md shadow-emerald-500/20" : "bg-gray-100 text-gray-400 cursor-not-allowed")}
+                              disabled={!hasServed}
+                            >
+                              <Wallet size={14} /> Thanh toán
+                            </button>
+                          )}
+                        </div>
+                        
+                        {allPaid && (userRole === 'owner' || userRole === 'cashier') && (
+                          <button 
+                            onClick={() => clearTable(tableNumber)}
+                            className="w-full mt-3 py-2.5 rounded-lg border-2 border-emerald-600 text-emerald-600 font-bold hover:bg-emerald-50 transition-all text-xs flex items-center justify-center gap-1"
+                          >
+                            <Check size={14} /> Hoàn tất & Trả bàn
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })
+              )}
+              </div>
             </motion.div>
           )}
 
@@ -567,9 +712,26 @@ export default function AdminDashboard({ user }: { user: User }) {
                         <p className="text-text-muted text-xs mt-1 line-clamp-2">{item.description}</p>
                         <div className="mt-4 flex justify-between items-center">
                           <span className="text-olive font-bold">{formatCurrency(item.price)}</span>
-                          <button className="text-border group-hover:text-accent transition-colors">
-                            <ChevronRight size={20} />
-                          </button>
+                          {userRole === 'owner' ? (
+                            <div className="flex gap-2">
+                              <button 
+                                onClick={() => setEditingItem(item)}
+                                className="w-8 h-8 rounded-full border border-border flex items-center justify-center text-text-muted hover:bg-amber-50 hover:text-amber-600 hover:border-amber-200 transition-all"
+                              >
+                                <Pencil size={14} />
+                              </button>
+                              <button 
+                                onClick={() => handleDeleteItem(item.id)}
+                                className="w-8 h-8 rounded-full border border-border flex items-center justify-center text-text-muted hover:bg-red-50 hover:text-red-600 hover:border-red-200 transition-all"
+                              >
+                                <Trash2 size={14} />
+                              </button>
+                            </div>
+                          ) : (
+                            <button className="text-border group-hover:text-accent transition-colors">
+                              <ChevronRight size={20} />
+                            </button>
+                          )}
                         </div>
                       </div>
                     </div>
@@ -621,6 +783,124 @@ export default function AdminDashboard({ user }: { user: User }) {
               </div>
             </motion.div>
           )}
+          {activeTab === 'management' && userRole === 'owner' && (
+            <motion.div
+              key="management"
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -10 }}
+              className="space-y-6"
+            >
+              <div className="bg-white p-8 rounded-2xl border border-border shadow-sm">
+                <div className="flex justify-between items-center mb-6">
+                  <h3 className="text-xl font-bold text-text-main">Quản lý & Báo cáo</h3>
+                  {restaurant?.plan !== 'pro' && (
+                    <span className="bg-amber-100 text-amber-700 px-3 py-1 rounded-full text-xs font-bold uppercase">Yêu cầu bản PRO</span>
+                  )}
+                </div>
+                
+                {restaurant?.plan === 'pro' ? (
+                  <div className="space-y-8">
+                    {/* Tổng quan */}
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <div className="p-6 bg-bg rounded-xl border border-border">
+                        <div className="text-sm font-bold text-text-muted mb-2 uppercase">Tổng doanh thu</div>
+                        <div className="text-2xl font-bold text-olive">
+                          {formatCurrency(orders.filter(o => o.status === 'paid' || o.status === 'completed' || o.status === 'archived').reduce((acc, o) => acc + o.total, 0))}
+                        </div>
+                      </div>
+                      <div className="p-6 bg-bg rounded-xl border border-border">
+                        <div className="text-sm font-bold text-text-muted mb-2 uppercase">Tổng số đơn</div>
+                        <div className="text-2xl font-bold text-text-main">
+                          {orders.filter(o => o.status === 'paid' || o.status === 'completed' || o.status === 'archived').length}
+                        </div>
+                      </div>
+                      <div className="p-6 bg-bg rounded-xl border border-border">
+                        <div className="text-sm font-bold text-text-muted mb-2 uppercase">Món bán chạy</div>
+                        <div className="text-lg font-bold text-text-main">Đang cập nhật...</div>
+                      </div>
+                    </div>
+
+                    {/* Doanh thu chi tiết */}
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                      {/* Doanh thu theo tuần (Tháng hiện tại) */}
+                      <div>
+                        <h4 className="text-sm font-bold text-text-muted uppercase mb-4">Doanh thu theo tuần (Tháng {new Date().getMonth() + 1})</h4>
+                        <div className="space-y-3">
+                          {[1, 2, 3, 4].map(week => {
+                            const weekRevenue = orders
+                              .filter(o => o.status === 'paid' || o.status === 'completed' || o.status === 'archived')
+                              .filter(o => {
+                                if (!o.createdAt) return false;
+                                const date = o.createdAt.toDate();
+                                const currentMonth = new Date().getMonth();
+                                const currentYear = new Date().getFullYear();
+                                if (date.getMonth() !== currentMonth || date.getFullYear() !== currentYear) return false;
+                                const firstDay = new Date(date.getFullYear(), date.getMonth(), 1).getDay();
+                                const offsetDate = date.getDate() + firstDay - 1;
+                                const w = Math.floor(offsetDate / 7) + 1;
+                                return w === week || (week === 4 && w > 4); // Group week 5 into week 4
+                              })
+                              .reduce((acc, o) => acc + o.total, 0);
+                            
+                            return (
+                              <div key={week} className="flex justify-between items-center p-3 bg-bg rounded-lg">
+                                <span className="font-medium text-text-main">Tuần {week}</span>
+                                <span className="font-bold text-olive">{formatCurrency(weekRevenue)}</span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {/* Doanh thu theo tháng (Năm hiện tại) */}
+                      <div>
+                        <h4 className="text-sm font-bold text-text-muted uppercase mb-4">Doanh thu theo tháng (Năm {new Date().getFullYear()})</h4>
+                        <div className="space-y-3 max-h-[240px] overflow-y-auto pr-2 custom-scrollbar">
+                          {Array.from({ length: 12 }).map((_, i) => {
+                            const monthRevenue = orders
+                              .filter(o => o.status === 'paid' || o.status === 'completed' || o.status === 'archived')
+                              .filter(o => {
+                                if (!o.createdAt) return false;
+                                const date = o.createdAt.toDate();
+                                return date.getMonth() === i && date.getFullYear() === new Date().getFullYear();
+                              })
+                              .reduce((acc, o) => acc + o.total, 0);
+                            
+                            if (monthRevenue === 0 && i > new Date().getMonth()) return null; // Hide future months
+                            
+                            return (
+                              <div key={i} className="flex justify-between items-center p-3 bg-bg rounded-lg">
+                                <span className="font-medium text-text-main">Tháng {i + 1}</span>
+                                <span className="font-bold text-olive">{formatCurrency(monthRevenue)}</span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="text-center py-10">
+                    <div className="w-16 h-16 bg-amber-100 text-amber-500 rounded-full flex items-center justify-center mx-auto mb-4">
+                      <BarChart3 size={32} />
+                    </div>
+                    <h4 className="text-lg font-bold text-text-main mb-2">Tính năng dành cho bản PRO</h4>
+                    <p className="text-text-muted mb-6 max-w-md mx-auto">
+                      Nâng cấp lên bản PRO để xem báo cáo doanh thu chi tiết theo tuần, tháng, năm và các phân tích chuyên sâu khác.
+                    </p>
+                    <button 
+                      onClick={() => setIsUpgradingPlan(true)}
+                      className="bg-amber-500 text-white px-6 py-3 rounded-xl font-bold hover:bg-amber-600 transition-colors"
+                    >
+                      Nâng cấp ngay
+                    </button>
+                  </div>
+                )}
+              </div>
+            </motion.div>
+          )}
+
           {activeTab === 'qr' && (
             <motion.div
               key="qr"
@@ -652,7 +932,7 @@ export default function AdminDashboard({ user }: { user: User }) {
 
                 <div className="text-center">
                   <div className="bg-bg p-8 rounded-2xl inline-block mb-8 border border-border">
-                    <QRCodeSVG value={`${qrUrl}&table=${selectedTable}`} size={200} level="H" includeMargin />
+                    <QRCodeSVG id="qr-code-svg" value={`${qrUrl}&table=${selectedTable}`} size={200} level="H" includeMargin />
                   </div>
                   <h3 className="text-xl font-serif text-text-main mb-2">Mã QR Bàn số {selectedTable}</h3>
                   <p className="text-text-muted text-sm mb-8">Khách hàng quét mã này sẽ tự động được nhận diện tại bàn {selectedTable}.</p>
@@ -663,7 +943,10 @@ export default function AdminDashboard({ user }: { user: User }) {
                     >
                       Thử Menu Bàn {selectedTable}
                     </button>
-                    <button className="bg-white border border-border text-text-main px-6 py-3 rounded-xl font-bold hover:bg-bg transition-colors text-sm">
+                    <button 
+                      onClick={downloadQR}
+                      className="bg-white border border-border text-text-main px-6 py-3 rounded-xl font-bold hover:bg-bg transition-colors text-sm"
+                    >
                       Tải xuống QR
                     </button>
                   </div>
@@ -702,6 +985,93 @@ export default function AdminDashboard({ user }: { user: User }) {
           )}
         </AnimatePresence>
       </main>
+
+      {/* Edit Item Modal */}
+      {editingItem && (
+        <div className="fixed inset-0 bg-sidebar/40 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <motion.div 
+            initial={{ scale: 0.9, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            className="bg-white rounded-3xl w-full max-w-lg p-8 shadow-2xl border border-border max-h-[90vh] overflow-y-auto"
+          >
+            <h3 className="text-xl font-serif text-text-main mb-6">Chỉnh sửa món</h3>
+            <form onSubmit={handleUpdateItem} className="space-y-4">
+              <div>
+                <label className="block text-[11px] uppercase tracking-wider text-text-muted font-bold mb-1.5">Tên món</label>
+                <input
+                  type="text"
+                  required
+                  value={editingItem.name}
+                  onChange={e => setEditingItem({...editingItem, name: e.target.value})}
+                  className="w-full px-4 py-3 rounded-xl border border-border focus:border-accent outline-none bg-bg text-sm"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-[11px] uppercase tracking-wider text-text-muted font-bold mb-1.5">Giá (VND)</label>
+                  <input
+                    type="number"
+                    required
+                    value={editingItem.price}
+                    onChange={e => setEditingItem({...editingItem, price: Number(e.target.value)})}
+                    className="w-full px-4 py-3 rounded-xl border border-border focus:border-accent outline-none bg-bg text-sm"
+                  />
+                </div>
+                <div className="relative">
+                  <label className="block text-[11px] uppercase tracking-wider text-text-muted font-bold mb-1.5">Danh mục</label>
+                  <div className="relative">
+                    <select
+                      value={editingItem.category}
+                      onChange={e => setEditingItem({...editingItem, category: e.target.value})}
+                      className="w-full px-4 py-3 rounded-xl border border-border focus:border-accent outline-none bg-bg text-sm appearance-none cursor-pointer pr-10"
+                    >
+                      {categories.map(cat => (
+                        <option key={cat} value={cat}>{cat}</option>
+                      ))}
+                    </select>
+                    <ChevronRight size={16} className="absolute right-4 top-1/2 -translate-y-1/2 text-text-muted pointer-events-none rotate-90" />
+                  </div>
+                </div>
+              </div>
+              <div>
+                <label className="block text-[11px] uppercase tracking-wider text-text-muted font-bold mb-1.5">Mô tả</label>
+                <textarea
+                  value={editingItem.description}
+                  onChange={e => setEditingItem({...editingItem, description: e.target.value})}
+                  className="w-full px-4 py-3 rounded-xl border border-border focus:border-accent outline-none bg-bg text-sm h-20 resize-none"
+                />
+              </div>
+              <div className="flex items-center gap-2 mt-4">
+                <input
+                  type="checkbox"
+                  id="available"
+                  checked={editingItem.available}
+                  onChange={e => setEditingItem({...editingItem, available: e.target.checked})}
+                  className="w-4 h-4 text-olive bg-bg border-border rounded focus:ring-olive"
+                />
+                <label htmlFor="available" className="text-sm font-medium text-text-main">
+                  Đang bán (Hiển thị trên menu)
+                </label>
+              </div>
+              <div className="flex gap-3 pt-4">
+                <button
+                  type="button"
+                  onClick={() => setEditingItem(null)}
+                  className="flex-1 px-4 py-3 rounded-xl border border-border text-text-main font-bold hover:bg-bg transition-colors text-sm"
+                >
+                  Hủy
+                </button>
+                <button
+                  type="submit"
+                  className="flex-1 px-4 py-3 rounded-xl bg-olive text-white font-bold hover:bg-olive/90 transition-colors text-sm"
+                >
+                  Lưu thay đổi
+                </button>
+              </div>
+            </form>
+          </motion.div>
+        </div>
+      )}
 
       {/* Add Item Modal */}
       {isAddingItem && (

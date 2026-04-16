@@ -6,6 +6,8 @@ export interface Restaurant {
   plan: 'standard' | 'pro';
   trialEndsAt: any;
   createdAt: any;
+  isSessionActive?: boolean;
+  sessionStartTime?: any;
 }
 
 export type UserRole = 'owner' | 'cashier' | 'waiter' | 'superadmin';
@@ -15,6 +17,11 @@ export interface UserProfile {
   phone: string;
   role: UserRole;
   restaurantId?: string;
+  ownerPhone?: string;
+  name?: string;
+  cccd?: string;
+  dob?: string;
+  address?: string;
   createdAt: any;
 }
 
